@@ -8,6 +8,7 @@ import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { auditEvents, batches, expenses, notifications, products, purchaseOrderItems, purchaseOrders, saleLines, sales, settings, stockMovements, suppliers, userProfiles, userRoles } from '@/lib/db/schema'
 import { accessRequestInput, batchInput, checkoutInput, expenseInput, productInput, profileInput, purchaseOrderInput, receivePurchaseInput, returnInput, settingInput, stockAdjustmentInput } from '@/lib/validation/pharmacy'
+import { assertPermission, type Permission } from '@/lib/permissions'
 
 type Role = 'administrator' | 'pharmacist' | 'cashier' | 'stock_manager'
 
@@ -17,10 +18,11 @@ async function actorId() {
   return session.user.id
 }
 
-async function requireRole(allowed: Role[]) {
+async function requireRole(allowed: Role[], permission?: Permission) {
   const id = await actorId()
-  const [assignment] = await db.select({ role: userRoles.role }).from(userRoles).where(eq(userRoles.userId, id)).limit(1)
+  const [assignment] = await db.select({ role: userRoles.role, accessLevel: userRoles.accessLevel, status: userRoles.status }).from(userRoles).where(eq(userRoles.userId, id)).limit(1)
   if (!assignment || !allowed.includes(assignment.role as Role)) throw new Error('Insufficient pharmacy permissions')
+  if (permission) assertPermission(assignment.role as Role, permission, assignment.accessLevel as 'limited' | 'standard' | 'full', assignment.status as 'pending' | 'active' | 'suspended')
   return id
 }
 
@@ -64,7 +66,7 @@ export async function getDashboardMetrics() {
 }
 
 export async function createProduct(input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'])
+  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'], 'products:write')
   const data = productInput.parse(input)
   const [product] = await db.insert(products).values({ ...data, unitPrice: data.unitPrice.toFixed(2) }).returning()
   await audit('created', 'product', product.id, { sku: product.sku })
@@ -73,7 +75,7 @@ export async function createProduct(input: unknown) {
 }
 
 export async function receiveBatch(input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'])
+  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'], 'inventory:write')
   const data = batchInput.parse(input)
   if (data.quantity === 0) throw new Error('Received quantity must be greater than zero')
   const result = await db.transaction(async (tx) => {
@@ -87,7 +89,7 @@ export async function receiveBatch(input: unknown) {
 }
 
 export async function adjustStock(input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'])
+  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'], 'inventory:write')
   const data = stockAdjustmentInput.parse(input)
   const result = await db.transaction(async (tx) => {
     const [batch] = await tx.select().from(batches).where(and(eq(batches.id, data.batchId), eq(batches.productId, data.productId))).for('update')
@@ -102,7 +104,7 @@ export async function adjustStock(input: unknown) {
 }
 
 export async function checkout(input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist', 'cashier'])
+  const actor = await requireRole(['administrator', 'pharmacist', 'cashier'], 'sales:write')
   const data = checkoutInput.parse(input)
   const existing = await db.select().from(sales).where(eq(sales.idempotencyKey, data.idempotencyKey)).limit(1)
   if (existing[0]) return existing[0]
@@ -136,7 +138,7 @@ export async function checkout(input: unknown) {
 }
 
 export async function returnSale(input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist'])
+  const actor = await requireRole(['administrator', 'pharmacist'], 'sales:write')
   const data = returnInput.parse(input)
   const result = await db.transaction(async (tx) => {
     const [sale] = await tx.select().from(sales).where(eq(sales.id, data.saleId)).for('update')
@@ -179,9 +181,19 @@ export async function listAuditEvents() {
 }
 
 export async function getReportSummary() {
-  await requireRole(['administrator', 'pharmacist'])
+  await requireRole(['administrator', 'pharmacist'], 'reports:read')
   const [metrics, salesRows, expenseRows] = await Promise.all([getDashboardMetrics(), listSales(), listExpenses()])
-  return { metrics, sales: salesRows, expenses: expenseRows }
+  const salesTotal = salesRows.reduce((sum, sale) => sum + Number(sale.total), 0)
+  const expensesTotal = expenseRows.filter((expense) => expense.status === 'posted').reduce((sum, expense) => sum + Number(expense.amount), 0)
+  return { metrics, sales: salesRows, expenses: expenseRows, salesTotal, expensesTotal, netMovement: salesTotal - expensesTotal }
+}
+
+function csvCell(value: unknown) { return `"${String(value ?? '').replaceAll('"', '""')}"` }
+
+export async function exportReportCsv() {
+  const report = await getReportSummary()
+  const rows = [['type', 'reference', 'amount', 'status', 'date'], ...report.sales.map((sale) => ['sale', sale.receiptNumber, sale.total, sale.status, sale.createdAt]), ...report.expenses.map((expense) => ['expense', expense.description, expense.amount, expense.status, expense.expenseDate])]
+  return rows.map((row) => row.map(csvCell).join(',')).join('\\n')
 }
 
 export async function listSales() {
@@ -207,7 +219,7 @@ export async function listPurchases() {
 }
 
 export async function createPurchaseOrder(input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'])
+  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'], 'purchases:write')
   const data = purchaseOrderInput.parse(input)
   const order = await db.transaction(async (tx) => {
     const [created] = await tx.insert(purchaseOrders).values({ orderNumber: `PO-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`, supplierId: data.supplierId, status: 'DRAFT', expectedAt: data.expectedAt ? new Date(data.expectedAt) : undefined, notes: data.notes, createdBy: await actorId() }).returning()
@@ -220,7 +232,7 @@ export async function createPurchaseOrder(input: unknown) {
 }
 
 export async function receivePurchaseOrder(purchaseOrderId: string, input: unknown) {
-  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'])
+  const actor = await requireRole(['administrator', 'pharmacist', 'stock_manager'], 'purchases:write')
   const data = receivePurchaseInput.parse(input)
   const result = await db.transaction(async (tx) => {
     const [order] = await tx.select().from(purchaseOrders).where(eq(purchaseOrders.id, purchaseOrderId)).for('update')
@@ -251,7 +263,7 @@ export async function receivePurchaseOrder(purchaseOrderId: string, input: unkno
 }
 
 export async function createExpense(input: unknown) {
-  await requireRole(['administrator', 'pharmacist'])
+  await requireRole(['administrator', 'pharmacist'], 'expenses:write')
   const data = expenseInput.parse(input)
   const [expense] = await db.insert(expenses).values({ ...data, amount: data.amount.toFixed(2), actorId: await actorId(), status: 'posted' }).returning()
   await audit('created', 'expense', expense.id, { amount: expense.amount })

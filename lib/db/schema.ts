@@ -15,6 +15,7 @@ export const products = pgTable('pharmacy_products', {
   unitOfMeasure: text('unit_of_measure').notNull().default('unit'),
   unitPrice: numeric('unit_price', { precision: 12, scale: 2 }).notNull().default('0'),
   isActive: boolean('is_active').notNull().default(true),
+  isControlled: boolean('is_controlled').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => ({ skuIdx: uniqueIndex('pharmacy_products_sku_idx').on(table.sku), barcodeIdx: uniqueIndex('pharmacy_products_barcode_idx').on(table.barcode) }))
