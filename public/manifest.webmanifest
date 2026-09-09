@@ -1,0 +1,13 @@
+{
+  "name": "CarePoint Pharmacy OS",
+  "short_name": "CarePoint",
+  "description": "Pharmacy inventory and operations workspace",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f9fd",
+  "theme_color": "#eaf6ff",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "/icon-light-32x32.png", "sizes": "32x32", "type": "image/png" }
+  ]
+}
